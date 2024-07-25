@@ -1,0 +1,88 @@
+name: Init Repository and Resolve Dynamic Template
+on:
+  - create
+  - workflow_dispatch
+
+jobs:
+  init_repo:
+    name: Init Repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: On template creation, check if inside Organization (variable can be already available)
+        if: ${{ github.event.action == 'create' }}
+        run: |
+          http_response=$(curl -o response.txt -w "%{response_code}" --no-progress-meter -X GET "https://api.github.com/users/${{ github.repository_owner }}")
+          if [ $http_response != "200" ]; then
+            echo "FATAL: GITHUB API - Error when trying to get user/organization information ${{ github.repository_owner }} (${http_response})."
+            cat response.txt
+            exit 1
+          fi
+          type=$(jq ".type" response.txt)
+          if [[ "$type" == "\"Organization\"" ]]; then
+            echo "IS_INSIDE_ORGANIZATION=1" >> $GITHUB_ENV
+          else
+            echo "IS_INSIDE_ORGANIZATION=0" >> $GITHUB_ENV
+            exit 1
+          fi
+
+      - name: Checkout
+        id: checkout
+        uses: actions/checkout@v4
+
+      - name: Create develop Branch
+        # need write permission on the token (not the case by default on organization)
+        run: |
+          git checkout -b develop
+          git push origin develop
+
+      # For organization, can also be done at organization level before
+      # If not organization, need the secrets PAT, so need repo tool
+      - name: Define Branch Protection
+        run: |
+          gh api "repos/${{ github.repository }}/branches/main/protection" --method PUT --input ./.github/workflows/init/branch_protection.json
+          gh api "repos/${{ github.repository }}/branches/develop/protection" --method PUT --input ./.github/workflows/init/branch_protection.json
+        env:
+          GH_TOKEN: ${{ secrets.PAT_DYNAMIC_TEMPLATE }}
+
+      # Need the secret token (ok in organization if global secret, if not need the repo tool)
+      - name: "TestSpace Project Creation"
+        id: testspace_creation
+        uses: fletort/testspace-create-action@v1
+        with:
+          token: ${{ secrets.TESTSPACE_TOKEN }}
+  
+      # Can be done in all the case, but not if we need variable (at this is my case)
+      # in this case, global org var is ok or need a repo tool
+      - name: "Manage Dynamic Template"
+        # if already done (we are in a replay case on a latter failure for example)
+        if: hashFiles('README.md.j2') != ''
+        # need write permission on the token (not the case by default on organization)
+        env:
+          TESTSPACE_SPACE_ID: ${{ steps.testspace_creation.outputs.id }}
+          CI_REPORT_REPO_PATH: ${{ vars.ci_report_repo_path }}
+        uses: fletort/jinja2-template-action@v1
+      
+      - name: "Commit And push Template Resolution"
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: 'Dynamic Template Substitution [skip ci]'
+          new_branch: 'template_resolution'
+
+      # For organization, can also be done at organization level before (one private key for the all organization)
+      # If not organization, need the secrets PAT, so need repo tool
+      - name: "Manage cnx to internal ${{ vars.ci_report_repo_path }} repo"
+        run: |
+          ssh-keygen -t rsa -b 4096 -C "Deployement to ${{ vars.ci_report_repo_path }}" -f key -N ""
+          gh secret set DEPLOY_CI_REPORT_KEY --repo ${{ github.repository }} < key
+          existing_id=$(gh repo deploy-key list --repo ${{ vars.ci_report_repo_path }} --json id,title --jq ".[] | select(.title | contains(\"${{ github.repository }}\")) | .id")
+          if [[ -n $existing_id ]]; then # Si la clé est déjà définie
+            echo -e "${cBLUE}The Public Key for ${{ github.repository }} already exist in ${{ vars.ci_report_repo_path }}, we delete it.${cSTOP}"
+            gh repo deploy-key delete $existing_id --repo ${{ vars.ci_report_repo_path }}
+          fi
+          echo -e "${cGREEN}Save Public Key in $CI_REPORT_PROJECT_PATH.${cSTOP}"
+          gh repo deploy-key add key.pub --repo ${{ vars.ci_report_repo_path }} --allow-write --title "Publication pour ${{ github.repository }}"
+        env:
+          GH_TOKEN: ${{ secrets.PAT_DYNAMIC_TEMPLATE }}
+
